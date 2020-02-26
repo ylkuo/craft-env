@@ -1,0 +1,33 @@
+environment:
+  - boundary
+  - tree
+  - toolshed
+  - workbench
+  - factory
+  - recycle_iron
+  - recycle_grass
+  - recycle_gold
+  - recycle_gem
+
+primitives:
+  - iron
+  - grass
+  - gold
+  - gem
+
+recipes:
+  none0:
+    iron: 1
+    _at: recycle_iron
+
+  none1:
+    grass: 1
+    _at: recycle_grass
+
+  none2:
+    gold: 1
+    _at: recycle_gold
+
+  none3:
+    gem: 1
+    _at: recycle_gem
