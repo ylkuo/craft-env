@@ -1,5 +1,7 @@
 from enum import IntEnum
 from gym import spaces
+from ltl.ltl2tree import replace_symbols
+from ltl.spot2ba import Automaton
 from PIL import Image
 from skimage.measure import block_reduce
 from skimage.transform import resize
@@ -207,12 +209,13 @@ class CraftWorldEnv(gym.Env):
         right = 3 # move right
         use   = 4 # use
 
-    def __init__(self, recipe_path,
+    def __init__(self, formula, recipe_path,
                  init_pos, init_dir, grid,
                  width=10, height=10,
                  window_width=7, window_height=7,
                  time_limit=10, use_gui=True,
-                 target_fps=None, is_headless=False):
+                 target_fps=None, is_headless=False,
+                 prefix_reward_decay=0.8):
         self.cookbook = Cookbook(recipe_path)
         # environment rl parameter
         self.actions = CraftWorldEnv.Actions
@@ -230,15 +233,29 @@ class CraftWorldEnv(gym.Env):
                            dtype=np.uint8),
                 spaces.Box(low=0, high=time_limit,
                            shape=(self.cookbook.n_kinds+2+4, ),
-                           dtype=np.float32)))
+                           dtype=np.float32),
+                spaces.Box(low=-1, high=1.,
+                           shape=(self.cookbook.n_kinds, 5),
+                           dtype=np.float32))
+            )
         else:
             self.n_features = \
-                2 * window_width * window_height * (self.cookbook.n_kinds+1) + \
-                self.cookbook.n_kinds + 4 + 1
-            self.observation_space = spaces.Box(low=0, high=time_limit,
-                                                shape=(self.n_features, ),
-                                                dtype=np.float32)
+                window_width * window_height * (self.cookbook.n_kinds+1) + \
+                self.cookbook.n_kinds + 4
+            self.observation_space = self.observation_space = spaces.Tuple((
+                spaces.Box(low=0, high=time_limit,
+                           shape=(self.n_features, ),
+                           dtype=np.float32),
+                spaces.Box(low=-1, high=1.,
+                           shape=(self.cookbook.n_kinds, 5),
+                           dtype=np.float32)
+            ))
+        self.prefix_reward_decay = prefix_reward_decay
         self.time_limit = time_limit
+        # convert the ltl formula to a Buchi automaton
+        self._formula = formula
+        self._alphabets = get_alphabets(recipe_path)
+        self.ba = Automaton(formula, self._alphabets)
         # set the environment
         self._width = width
         self._height = height
@@ -263,7 +280,40 @@ class CraftWorldEnv(gym.Env):
     def get_data(self):
         return self._init_grid, self._init_pos, self._init_dir
 
-    def step(self, action):
+    def predicates(self, prev_ds, prev_inv):
+        pred = []
+        # check if the neighbors have env thing
+        for nx, ny in nears(self.pos, self._width, self._height):
+            here = self.grid[nx, ny, :]
+            if not self.grid[nx, ny, :].any():
+                continue
+            assert here.sum() == 1
+            thing = here.argmax()
+            if thing in self.cookbook.environment:
+                if 'recycle' in self.cookbook.index.get(thing):
+                    continue  # temp for basic
+                if self.cookbook.index.get(thing) not in pred:
+                    pred.append(self.cookbook.index.get(thing))
+        # check if any item in the inventory
+        for thing, count in enumerate(self.inventory):
+            name = self.cookbook.index.get(thing)
+            if count > 0 and 'none' not in name:
+                pred.append(name)
+        # check if getting closer to an item
+        ds = self.dist2items()
+        delta = ds - prev_ds
+        delta_inv = self.inventory - prev_inv
+        for thing, d in enumerate(delta):
+            name = self.cookbook.index.get(thing)
+            if 'recycle' in name:
+                continue
+            if d < 0 or (-0.1 < d < 0.1 and sum(delta_inv) > 0 ) :
+                pred.append('C_' + name)
+        return pred
+
+    def step(self, action, no_eval=False):
+        prev_ds = self.dist2items()
+        prev_inv = copy.deepcopy(self.inventory)
         x, y = self.pos
         n_dir = action
         if action == self.actions.left:
@@ -312,12 +362,73 @@ class CraftWorldEnv(gym.Env):
                             self.inventory[i] -= inputs[i]
                         success = True
                 break
-        # TODO: Add your own rule of the game and the reward
-        done = False
-        reward = 1
+        if no_eval:
+            return
+        # get predicates
+        trans = self.predicates(prev_ds, prev_inv)
+        self._seq.append(trans)
+        done = len(self._seq) >= self.time_limit
+        # check if it is prefix or accepting state
+        is_prefix, dist_to_accept, last_states = \
+                self.ba.is_prefix([self._seq[-1]], self._last_states)
+        is_accpet = is_prefix and dist_to_accept < 0.1
+        if is_accpet:  # not done even if it is in accept state
+            reward = 1
+            self._last_states = set([s for s in last_states if self.ba.is_accept(s)])
+        elif is_prefix:
+            if len(last_states.intersection(self._last_states)) > 0:
+                self._state_visit_count += 1
+            else:
+                self._state_visit_count = 1
+            self._last_states = last_states
+            if self._state_visit_count == 1:
+                reward = 0.1
+            else:
+                reward = 0.1 * (self.prefix_reward_decay ** (self._state_visit_count - 1))
+        else:
+            reward = -1
+            done = True
         if self._use_gui:
             self.gui.draw()
         return self.feature(), reward, done, {}
+
+    def dist2items(self):
+        total_ds = float(self._width-2 + self._height-2)  # -2 because of boundary
+        min_ds = np.ones(self.cookbook.n_kinds) * total_ds
+        for y in reversed(range(self._height)):
+            for x in range(self._width):
+                if not (self.grid[x, y, :].any() or (x, y) == self.pos):
+                    continue
+                else:
+                    thing = self.grid[x, y, :].argmax()
+                    d = abs(x - self.pos[0]) + abs(y - self.pos[1])
+                    if min_ds[thing] > d:
+                        min_ds[thing] = d
+        # distance is zero if own the item
+        for i, count in enumerate(self.inventory):
+            if count > 0:
+                min_ds[i] = 0
+        return min_ds
+
+    def closer_feature(self):
+        ds = []
+        # remember the current config
+        current_ds = self.dist2items()
+        current_grid = copy.deepcopy(self.grid)
+        current_inventory = copy.deepcopy(self.inventory)
+        current_pos = copy.deepcopy(self.pos)
+        current_dir = copy.deepcopy(self.dir)
+        for action in range(5):
+            # take step
+            self.step(action, no_eval=True)
+            ds.append(current_ds-self.dist2items())
+            # restore the current grid
+            self.grid = copy.deepcopy(current_grid)
+            self.inventory = copy.deepcopy(current_inventory)
+            self.pos = copy.deepcopy(current_pos)
+            self.dir = copy.deepcopy(current_dir)
+        ds = np.asarray(ds)
+        return np.transpose(ds, (1, 0))
 
     def feature(self):
         x, y = self.pos
@@ -347,7 +458,7 @@ class CraftWorldEnv(gym.Env):
             out_img = resize(out_img, [80, 80, 3],
                              preserve_range=True, anti_aliasing=True)
             out_values = np.concatenate((self.inventory, pos_feats, dir_features))
-            features = {0: out_img.astype(np.uint8), 1: out_values}
+            features = {0: out_img.astype(np.uint8), 1: out_values, 2: self.closer_feature()}
         else:
             hw = int(self._window_width / 2)
             hh = int(self._window_height / 2)
@@ -364,7 +475,7 @@ class CraftWorldEnv(gym.Env):
             features = np.concatenate((grid_feats.ravel(),
                     grid_feats_big_red.ravel(), self.inventory, 
                     dir_features, [0]))
-            assert len(features) == self.n_features
+            features = {0: out_grid, 1: self.closer_feature()}
         return features
 
     def reset(self):
@@ -418,6 +529,7 @@ def get_alphabets(recipe_path):
         if 'none' in item or 'recycle' in item:
             continue
         alphabets.append(item)
+        alphabets.append('C_'+item)  # the predicate for closer to item
     return alphabets
 
 
@@ -467,7 +579,8 @@ def sample_craft_env(args, width=10, height=10, env_data=None):
     else:
         grid, init_pos, init_dir = env_data
     # return the env
-    return CraftWorldEnv(args.recipe_path,
+    return CraftWorldEnv(args.formula,
+                         args.recipe_path,
                          init_pos, init_dir, grid,
                          width=width, height=height,
                          use_gui=args.use_gui,
@@ -480,13 +593,19 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Craft world')
     args = parser.parse_args()
     args.recipe_path = 'craft_recipes_basic.yaml'
+    formula = '( ( F factory ) & ( F G gem ) )'
+    args.formula = replace_symbols(formula, 'Craft')
+    print('Converted formula', args.formula)
     args.num_steps = 25
     args.target_fps = 60
     args.use_gui = True
     args.is_headless = False
     env = sample_craft_env(args)
+    print('Generated env:')
+    env.visualize()
     while True:
         env.gui.draw(move_first=True)
         feature = env.feature()
         img = Image.fromarray(feature[0])
         img.save('tmp_images/feature.png')
+
