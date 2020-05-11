@@ -14,6 +14,7 @@ import os
 import pygame
 import time
 import yaml
+import json
 
 
 def neighbors(pos, width, height, dir=None):
@@ -137,27 +138,30 @@ class CraftGui(object):
         pygame.display.set_caption(caption)
         self._clock = pygame.time.Clock()
 
-    def move(self):
-        for event in pygame.event.get():
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_UP:
-                    obs, reward, done, _ = self._env.step(self._env.actions.up)
-                elif event.key == pygame.K_DOWN:
-                    obs, reward, done, _ = self._env.step(self._env.actions.down)
-                elif event.key == pygame.K_LEFT:
-                    obs, reward, done, _ = self._env.step(self._env.actions.left)
-                elif event.key == pygame.K_RIGHT:
-                    obs, reward, done, _ = self._env.step(self._env.actions.right)
-                elif event.key == pygame.K_SPACE:
-                    obs, reward, done, _ = self._env.step(self._env.actions.use)
-                    self._env.print_inventory()
-                else:
-                    continue
-                print('reward: {}, done: {}'.format(reward, done))
+    def move(self, move_idx):
+        obs, reward, done, _ = self._env.step(move_idx)
+        print('reward: {}, done: {}'.format(reward, done))
 
-    def draw(self, move_first=False):
+        #for event in pygame.event.get():
+        #    if event.type == pygame.KEYDOWN:
+        #        if event.key == pygame.K_UP:
+        #            obs, reward, done, _ = self._env.step(self._env.actions.up)
+        #        elif event.key == pygame.K_DOWN:
+        #            obs, reward, done, _ = self._env.step(self._env.actions.down)
+        #        elif event.key == pygame.K_LEFT:
+        #            obs, reward, done, _ = self._env.step(self._env.actions.left)
+        #        elif event.key == pygame.K_RIGHT:
+        #            obs, reward, done, _ = self._env.step(self._env.actions.right)
+        #        elif event.key == pygame.K_SPACE:
+        #            obs, reward, done, _ = self._env.step(self._env.actions.use)
+        #            self._env.print_inventory()
+        #        else:
+        #            continue
+        #        print('reward: {}, done: {}'.format(reward, done))
+
+    def draw(self, move_idx=None, move_first=False):
         if move_first:
-            self.move()
+            self.move(move_idx)
         bg_color = (255, 255, 255)
         self._screen.fill(bg_color)
         row = 0
@@ -347,7 +351,7 @@ class CraftWorldEnv(gym.Env):
             out_img = resize(out_img, [80, 80, 3],
                              preserve_range=True, anti_aliasing=True)
             out_values = np.concatenate((self.inventory, pos_feats, dir_features))
-            features = {0: out_img.astype(np.uint8), 1: out_values}
+            features = {0: out_img.astype(np.uint8), 1: out_values, 2: img}
         else:
             hw = int(self._window_width / 2)
             hh = int(self._window_height / 2)
@@ -479,14 +483,34 @@ def sample_craft_env(args, width=10, height=10, env_data=None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Craft world')
     args = parser.parse_args()
-    args.recipe_path = 'craft_recipes_basic.yaml'
+    args.recipe_path = '/storage/czw/ltl-rl/worlds/craft_recipes_basic.yaml'
     args.num_steps = 25
     args.target_fps = 60
     args.use_gui = True
     args.is_headless = False
-    env = sample_craft_env(args)
-    while True:
-        env.gui.draw(move_first=True)
+
+    with open('/storage/czw/ltl-rl/czw_test') as f:
+        ltl = json.load(f)
+
+    test = ltl["data"][1]
+    print(test["sentence"])
+    print(test["formula"])
+    grid = np.array(test["env"]["init_grid"])
+    width, height = grid.shape
+    cookbook = Cookbook(args.recipes_path)
+    one_hot = np.zeros((width*height, cookbook.n_kinds+1))
+    grid = grid.flatten()
+    one_hot[np.arange(width*height), grid] = 1
+    one_hot[:,0] = 0 #0 encoded as 0
+    one_hot = one_hot.reshape((width, height, cookbook.n_kinds+1))
+
+    env_data = [one_hot, tuple(test["env"]["init_pos"]), test["env"]["init_dir"]]
+    env = sample_craft_env(args, env_data=env_data, width=width, height=height)
+    for i in range(len(test["actions"])):
+        move_idx = test["actions"][i]
+        env.gui.draw(move_idx=move_idx, move_first=True)
         feature = env.feature()
-        img = Image.fromarray(feature[0])
-        img.save('tmp_images/feature.png')
+        #img = Image.fromarray(feature[0])
+        img = feature[2]
+        img.save(f'tmp_images/{i:03}.png')
+        time.sleep(1)
